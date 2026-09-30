@@ -1,152 +1,60 @@
-import { str  } from './defs.js'
+const encoder = new TextEncoder()
+const listeners = new Map<ReadableStreamDefaultController<Uint8Array>, string | undefined>()
 
 
+export function AddListener(req:Request, localdb_scope?:string):Response {
+	let heartbeat:ReturnType<typeof setInterval>
+	let controller:ReadableStreamDefaultController<Uint8Array>
 
-
-
-
-type ListenerT = {
-    id:str,
-    cb:(trigger:string, obj:any)=>void,
-	endit:()=>void
-	checkit:()=>void
-}
-
-const listeners:Map<str,ListenerT> = new Map()
-let   isshuttingdown = false
-
-
-
-function Add_Listener(req:any, res:any) {
-
-	if (isshuttingdown) {
-		res.statusCode = 503
-		res.end()
-		return
+	function cleanup() {
+		clearInterval(heartbeat)
+		listeners.delete(controller)
+		req.signal.removeEventListener("abort", on_abort)
 	}
 
+	function on_abort() {
+		cleanup()
+		controller.close()
+	}
 
-    const id = req.query.id as str
-    const l = listeners.get(id)
-
-    if (l) {
-		listeners.delete(id)
-    }
-
-    listeners.set(id, {
-        id,
-        cb: (trigger:string, data:any)=> {
-            res.write(`event: ${trigger}\n`)
-            res.write(`data: ${JSON.stringify(data)}\n`)
-            res.write('\n')
-        },
-		endit: ()=> {
-			res.end()
+	const stream = new ReadableStream<Uint8Array>({
+		start(stream_controller) {
+			controller = stream_controller
+			listeners.set(controller, localdb_scope)
+			controller.enqueue(encoder.encode(": connected\nretry: 15000\n\n"))
+			// Stay below Bun's default 10-second idle timeout.
+			heartbeat = setInterval(() => controller.enqueue(encoder.encode(": heartbeat\n\n")), 5000)
+			req.signal.addEventListener("abort", on_abort, { once: true })
 		},
-		checkit: ()=> {
-			if (res.writable && !res.destroyed && !res.writableEnded) {
-				res.write(':\n\n'); // Send a comment to keep the connection alive
-			} else {
-				cleanUp(id)
-			}
-		}
-    })
+		cancel: cleanup,
+	})
 
-	console.info(`New SSE listener: ${id} with listeners count: ${listeners.size}`)
-
-	res.socket.setNoDelay(true);
-
-    res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': "keep-alive",
-        'Access-Control-Allow-Origin': '*'
-    })
-
-    res.write('event: connected\n')
-    res.write('data: { "message": "hey connected" }\n')
-	res.write('retry: 15000\n')
-    res.write('\n')
-
-    req.on('close', ()=> { cleanUp(id)} )
-    req.on('finish', ()=> { cleanUp(id)} )
-    req.on('error', ()=> { console.log("req.on error"); cleanUp(id)} )
-}
-
-
-
-
-function TriggerEvent(eventname:string, data:any, opts:{exclude?:str[]}={}) {
-    listeners.forEach(l => {
-        if (opts.exclude && opts.exclude.includes(l.id)) return;
-		l.cb(eventname, data)
-    })
-}
-
-
-
-
-function TriggerEventOne(eventname:string, sse_id:str, data:any) : boolean {
-	const listener = listeners.get(sse_id)
-	if (!listener) return false
-
-	listener.cb(eventname, data)
-	return true
-}
-
-
-
-
-function cleanUp(id:str) {
-	const listener = listeners.get(id)
-	if (!listener) return
-	listener.endit()
-	listeners.delete(id)
-}
-
-function routinemaintenance() {
-	listeners.forEach(l => {
-		l.checkit()
+	return new Response(stream, {
+		headers: {
+			"Content-Type": "text/event-stream; charset=UTF-8",
+			"Cache-Control": "no-cache, no-transform",
+			"Connection": "keep-alive",
+		},
 	})
 }
 
 
-setTimeout(routinemaintenance, 30000)
+// Publish resource keys after the corresponding write commits. No record data is sent.
+// Unhandled Case: scope listeners by authenticated tenant before broadcasting tenant-specific keys.
+// Unhandled Case: distribute notifications between server processes when running multiple instances.
+export function NotifyChanged(paths:string[]):void {
+	if (!paths.length) return
 
-
-
-
-/*
-function remove_listener(l:Listener) {
-
-    l.httpres.destroy()
-    listeners.delete(l.unique_identifier)
+	SendEvent("changed", paths)
 }
-*/
 
 
-
-
-process.on('SIGTERM', ()=> {
-
-	isshuttingdown = true
-
-    console.info('Received SIGTERM signal. Cleaning up SSE listeners.');
-
-    listeners.forEach((listener) => {
-        try {
-            listener.endit();
-			listeners.delete(listener.id)
-        } catch (e) {
-            console.error(`Error while ending listener ${listener.id}:`, e);
-        }
-    });
-
-    listeners.clear();
-
-	setTimeout(()=> {
-		process.exit(0);
-	}, 5000)
-});
-
-export default { Add_Listener, TriggerEvent, TriggerEventOne }
+// Separate named protocols can share the connection. Only the legacy changed event
+// broadcasts without a scope; localdb record data always supplies an authenticated scope.
+export function SendEvent(event:string, data:unknown, scope?:string):void {
+	const message = encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+	for (const [listener, listener_scope] of listeners) {
+		if (scope !== undefined && listener_scope !== scope) continue
+		listener.enqueue(message)
+	}
+}

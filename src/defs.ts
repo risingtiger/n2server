@@ -14,8 +14,9 @@ export type LazyloadT = {
 	urlmatch_regex?:RegExp,
 	name:string,
 	is_instance:boolean,
-	dependencies:LazyloadDependencyT[],
+	dependencies:LazyloadDependencyT[]|null,
 	auth:unknown[],
+	localdb?:string[],
 }
 
 //export const enum SSETriggersE { FIRESTORE, FIRESTORE_DOC_ADD, FIRESTORE_DOC_PATCH, FIRESTORE_DOC_DELETE, FIRESTORE_COLLECTION, CUSTOM }
